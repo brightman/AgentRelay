@@ -118,6 +118,13 @@ python gen_relay_key.py
 
 这是最常见的本地或单机部署方式。
 
+如果你想直接用仓库里的脚本：
+
+```bash
+./start_relay_server.sh
+./test_client_dm.sh "hello"
+```
+
 ### 1. 启动 relay
 
 ```bash
