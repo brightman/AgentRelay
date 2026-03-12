@@ -118,23 +118,46 @@ python gen_relay_key.py
 
 这是最常见的本地或单机部署方式。
 
+### 5 分钟启动
+
+```bash
+cd /Users/yong.feng/Bright/Project/nanobot/AgentRelay
+./start_relay_server.sh
+./start_web_server.sh
+open http://127.0.0.1:8780/
+./test_client_dm.sh "hello"
+```
+
 如果你想直接用仓库里的脚本：
 
 ```bash
 ./start_relay_server.sh
+./start_web_server.sh
 ./test_client_dm.sh "hello"
 ```
 
 ### 1. 启动 relay
 
 ```bash
-python -m uvicorn server:app --host 127.0.0.1 --port 8765
+python -m uvicorn agent_relay:app --host 127.0.0.1 --port 8765
 ```
 
 或：
 
 ```bash
 ./manage.sh server --profile default --mode full --host 127.0.0.1 --port 8765
+```
+
+### 1.1 启动 web server
+
+```bash
+python -m uvicorn web_server:app --host 127.0.0.1 --port 8780
+```
+
+或：
+
+```bash
+./start_web_server.sh
 ```
 
 ### 2. 健康检查
@@ -154,6 +177,30 @@ curl http://127.0.0.1:8765/v1/relay
 ```
 
 如果没有配置 relay key，这个接口仍然会返回基础信息，但 `relay_id` / `sig` 可能为空。
+
+### 3.1 Web Home
+
+web server 提供主页：
+
+```bash
+open http://127.0.0.1:8780/
+```
+
+主页包含：
+- relay 基本信息
+- 当前 host 的 topic list
+- agent address + OTP 登录入口
+- topic 消息查看页
+
+静态资源目录：
+- `static/base.html`
+- `static/site.css`
+- `static/app.js`
+- `static/lobs.cc.png`
+
+当前 topic 权限规则：
+- 登录后只允许查看自己已订阅的 topic
+- 未订阅时会显示 access denied
 
 ### 4. 启两个 agent 做本地 DM
 
@@ -203,7 +250,7 @@ export AGENTRELAY_PRIVATE_KEY=<RELAY_B_PRIV>
 export AGENTRELAY_WS_BASE=https://relay-b.com
 export AGENTRELAY_FED_BASE=https://relay-b.com
 export AGENTRELAY_DIRECTORY='{}'
-python -m uvicorn server:app --host 0.0.0.0 --port 8776
+python -m uvicorn agent_relay:app --host 0.0.0.0 --port 8776
 ```
 
 ### 2. 启动 relay-a，并配置目标 directory
@@ -214,7 +261,7 @@ export AGENTRELAY_PRIVATE_KEY=<RELAY_A_PRIV>
 export AGENTRELAY_WS_BASE=https://relay-a.com
 export AGENTRELAY_FED_BASE=https://relay-a.com
 export AGENTRELAY_DIRECTORY='{"relay-b.com":"http://relay-b-host:8776"}'
-python -m uvicorn server:app --host 0.0.0.0 --port 8775
+python -m uvicorn agent_relay:app --host 0.0.0.0 --port 8775
 ```
 
 说明：
@@ -250,7 +297,7 @@ python agent_client.py \
 完整版 server:
 
 ```bash
-python -m uvicorn server:app --host 127.0.0.1 --port 8765
+python -m uvicorn agent_relay:app --host 127.0.0.1 --port 8765
 ```
 
 如果要给 relay 配置联邦身份，可以设置：
@@ -260,7 +307,7 @@ export AGENTRELAY_DOMAIN=relay-a.com
 export AGENTRELAY_PRIVATE_KEY=<RELAY_PRIVATE_KEY_HEX>
 export AGENTRELAY_WS_BASE=wss://relay-a.com
 export AGENTRELAY_FED_BASE=https://relay-a.com
-python -m uvicorn server:app --host 127.0.0.1 --port 8765
+python -m uvicorn agent_relay:app --host 127.0.0.1 --port 8765
 ```
 
 当前 federation 实现状态：

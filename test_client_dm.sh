@@ -10,10 +10,10 @@ BOT_ID="${BOT_ID:-6ed60419f60b078c67837714d740016154ee70d3aca8203cdae040ad2876b5
 CLIENT_PRIV="${CLIENT_PRIV:-7c8da769a5b9cf5f121e406328b2b4d547ba90e2f09687a441929488c9f7c7c7}"
 CLIENT_ID="${CLIENT_ID:-d03ecba46e21d327e9c3f83cde7f652c4e2ea497337860e5222a1a6f1bf3523f}"
 
-if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
-  PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
-elif [[ -x "$ROOT_DIR/../.venv/bin/python" ]]; then
+if [[ -x "$ROOT_DIR/../.venv/bin/python" ]]; then
   PYTHON_BIN="$ROOT_DIR/../.venv/bin/python"
+elif [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
 else
   PYTHON_BIN="${PYTHON_BIN:-python3}"
 fi

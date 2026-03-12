@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import html
 import json
 import os
 import secrets
@@ -10,13 +11,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Cookie, FastAPI, Form, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from nacl.encoding import HexEncoder
 from nacl.signing import SigningKey, VerifyKey
 
 from identity import format_agent_ref, normalize_agent_id, parse_agent_address
 
 DB_PATH = Path("channel.db")
+STATIC_DIR = Path("static")
+BASE_TEMPLATE_PATH = STATIC_DIR / "base.html"
+LOGO_PATH = STATIC_DIR / "lobs.cc.png"
 SYSTEM_CHAT_TYPE = "system"
 DM_CHAT_TYPE = "dm"
 TOPIC_CHAT_TYPE = "topic"
@@ -45,6 +50,8 @@ class RelaySession:
 
 sessions: Dict[str, Session] = {}
 relay_sessions: Dict[str, RelaySession] = {}
+web_sessions: Dict[str, str] = {}
+pending_web_logins: Dict[str, dict[str, Any]] = {}
 relay_started_at = int(time.time())
 
 if RELAY_PRIVATE_KEY_HEX:
@@ -290,6 +297,19 @@ def init_db() -> None:
             """
         )
         conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_directory (
+                agent_id TEXT PRIMARY KEY,
+                agent_address TEXT NOT NULL,
+                visible INTEGER NOT NULL DEFAULT 1,
+                profile_json TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                last_seen_at INTEGER
+            )
+            """
+        )
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_deliveries_agent_status ON deliveries_v2(agent_id, status)"
         )
         conn.execute(
@@ -462,6 +482,9 @@ def event_recipients(event: dict) -> list[str]:
 
 
 def create_message(event: dict, sig_b64: str, recipients: list[str]) -> None:
+    upsert_agent_directory(event["from"], last_seen=True)
+    for recipient in recipients:
+        upsert_agent_directory(recipient)
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute(
@@ -610,6 +633,463 @@ def list_messages(agent_id: str, peer_id: str = "", chat_id: str = "", since_ts:
         conn.close()
 
 
+def list_topics() -> list[dict[str, Any]]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            WITH known_topics AS (
+                SELECT chat_id AS topic_id
+                FROM messages_v2
+                WHERE chat_type = ?
+                UNION
+                SELECT topic AS topic_id
+                FROM topic_subscriptions
+            )
+            SELECT
+                k.topic_id,
+                COALESCE(m.message_count, 0) AS message_count,
+                COALESCE(s.subscriber_count, 0) AS subscriber_count,
+                COALESCE(m.last_created_at, 0) AS last_created_at
+            FROM known_topics k
+            LEFT JOIN (
+                SELECT chat_id, COUNT(*) AS message_count, MAX(created_at) AS last_created_at
+                FROM messages_v2
+                WHERE chat_type = ?
+                GROUP BY chat_id
+            ) m ON m.chat_id = k.topic_id
+            LEFT JOIN (
+                SELECT topic, COUNT(*) AS subscriber_count
+                FROM topic_subscriptions
+                GROUP BY topic
+            ) s ON s.topic = k.topic_id
+            ORDER BY last_created_at DESC, topic_id ASC
+            """,
+            (TOPIC_CHAT_TYPE, TOPIC_CHAT_TYPE),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def list_agent_topics(agent_id: str) -> list[str]:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT topic FROM topic_subscriptions WHERE agent_id=? ORDER BY created_at ASC",
+            (agent_id,),
+        ).fetchall()
+        return [row[0] for row in rows]
+    finally:
+        conn.close()
+
+
+def list_topic_messages(topic_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT event_id, from_id, text, content_type, attachments_json, metadata_json, created_at, sig
+            FROM messages_v2
+            WHERE chat_type = ? AND chat_id = ?
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (TOPIC_CHAT_TYPE, topic_id, limit),
+        ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["attachments"] = _json_loads(item.pop("attachments_json", "[]"), [])
+            item["metadata"] = _json_loads(item.pop("metadata_json", "{}"), {})
+            item["from_address"] = _sender_address_for_item(item["from_id"], item["metadata"])
+            items.append(item)
+        return items
+    finally:
+        conn.close()
+
+
+def upsert_agent_directory(agent_id: str, *, last_seen: bool = False) -> None:
+    agent_ref = format_agent_ref(agent_id, RELAY_DOMAIN)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        ts = now_ts()
+        conn.execute(
+            """
+            INSERT INTO agent_directory(agent_id, agent_address, visible, profile_json, created_at, updated_at, last_seen_at)
+            VALUES(?, ?, 1, '{}', ?, ?, ?)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                agent_address=excluded.agent_address,
+                updated_at=excluded.updated_at,
+                last_seen_at=CASE
+                    WHEN excluded.last_seen_at IS NULL THEN agent_directory.last_seen_at
+                    ELSE excluded.last_seen_at
+                END
+            """,
+            (agent_id, agent_ref["agent_address"], ts, ts, ts if last_seen else None),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_visible_agents() -> list[dict[str, Any]]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            WITH discovered(agent_id) AS (
+                SELECT agent_id FROM agent_directory
+                UNION
+                SELECT from_id FROM messages_v2
+                UNION
+                SELECT owner_agent FROM acl_allow
+                UNION
+                SELECT sender_agent FROM acl_allow
+                UNION
+                SELECT owner_agent FROM blacklist
+                UNION
+                SELECT blocked_agent FROM blacklist
+                UNION
+                SELECT agent_id FROM topic_subscriptions
+            )
+            SELECT
+                d.agent_id,
+                COALESCE(ad.agent_address, '') AS agent_address,
+                COALESCE(ad.visible, 1) AS visible,
+                ad.last_seen_at,
+                COALESCE(ts.topic_count, 0) AS topic_count,
+                COALESCE(msg.message_count, 0) AS message_count
+            FROM discovered d
+            LEFT JOIN agent_directory ad ON ad.agent_id = d.agent_id
+            LEFT JOIN (
+                SELECT agent_id, COUNT(*) AS topic_count
+                FROM topic_subscriptions
+                GROUP BY agent_id
+            ) ts ON ts.agent_id = d.agent_id
+            LEFT JOIN (
+                SELECT from_id AS agent_id, COUNT(*) AS message_count
+                FROM messages_v2
+                GROUP BY from_id
+            ) msg ON msg.agent_id = d.agent_id
+            WHERE COALESCE(ad.visible, 1) = 1
+            ORDER BY d.agent_id ASC
+            """
+        ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            if not item["agent_address"]:
+                item["agent_address"] = format_agent_ref(item["agent_id"], RELAY_DOMAIN)["agent_address"]
+            item["online"] = item["agent_id"] in sessions
+            items.append(item)
+        return items
+    finally:
+        conn.close()
+
+
+def agent_can_view_topic(agent_id: str, topic_id: str) -> bool:
+    return is_topic_subscriber(topic_id, agent_id)
+
+
+def current_web_agent(session_token: str | None) -> str:
+    if not session_token:
+        return ""
+    return web_sessions.get(session_token, "")
+
+
+def current_web_agent_address(session_token: str | None) -> str:
+    agent_id = current_web_agent(session_token)
+    if not agent_id:
+        return ""
+    return format_agent_ref(agent_id, RELAY_DOMAIN)["agent_address"]
+
+
+async def deliver_system_message(agent_id: str, content: str) -> bool:
+    if not RELAY_ID or not _relay_signing_key:
+        return False
+    session = sessions.get(agent_id)
+    if not session:
+        return False
+    event = {
+        "id": secrets.token_hex(16),
+        "from": RELAY_ID,
+        "chat": {"id": f"system:{agent_id}", "type": SYSTEM_CHAT_TYPE},
+        "kind": "message",
+        "created_at": now_ts(),
+        "content": content,
+        "content_type": "text/plain",
+        "attachments": [],
+        "metadata": {
+            "_agentrelay": {
+                "from_address": format_agent_ref(RELAY_ID, RELAY_DOMAIN)["agent_address"],
+            }
+        },
+    }
+    sig = relay_sign_b64(canonical_event_payload(event))
+    return await safe_send(session.ws, {"type": "deliver", "event": event, "sig": sig})
+
+
+def html_page(title: str, body: str) -> HTMLResponse:
+    if BASE_TEMPLATE_PATH.exists():
+        doc = BASE_TEMPLATE_PATH.read_text(encoding="utf-8")
+        doc = doc.replace("__TITLE__", html.escape(title))
+        doc = doc.replace("__BODY__", body)
+    else:
+        doc = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+  <link rel="stylesheet" href="/static/site.css">
+</head>
+<body>
+  <div class="wrap">{body}</div>
+  <script src="/static/app.js"></script>
+</body>
+</html>"""
+    return HTMLResponse(doc)
+
+
+def render_home(
+    agent_id: str = "",
+    *,
+    error: str = "",
+    pending_token: str = "",
+    pending_address: str = "",
+) -> HTMLResponse:
+    topics = list_topics()
+    agents = list_visible_agents()
+    online_agents = [item for item in agents if item["online"]]
+    discovery = relay_discovery_payload()
+    logged_in_address = format_agent_ref(agent_id, RELAY_DOMAIN)["agent_address"] if agent_id else ""
+    logged_in_short = ""
+    if logged_in_address:
+        localpart = logged_in_address.split("@", 1)[0]
+        logged_in_short = f"{localpart[:10]}..." if len(localpart) > 10 else localpart
+    has_logo = LOGO_PATH.exists()
+    topic_items = []
+    for topic in topics:
+        topic_id = html.escape(topic["topic_id"])
+        topic_items.append(
+            f"""<li>
+  <div><a href="/topic?chat_id={topic_id}">{topic_id}</a></div>
+  <div class="meta">messages={topic["message_count"]} subscribers={topic["subscriber_count"]}</div>
+</li>"""
+        )
+    if not topic_items:
+        topic_items.append('<li class="muted">No topic yet.</li>')
+
+    login_panel = ""
+    login_summary_label = logged_in_short if agent_id else "Login"
+    login_open = " open" if (pending_token or error) else ""
+    if agent_id:
+        my_topics = list_agent_topics(agent_id)
+        subs = "".join(f"<li>{html.escape(topic)}</li>" for topic in my_topics) or '<li class="muted">No subscription.</li>'
+        login_panel = f"""
+<div class="card compact-card">
+  <h2>Agent Session</h2>
+  <p class="muted">Logged in as</p>
+  <pre>{html.escape(logged_in_address)}</pre>
+  <p class="muted">Agent ID</p>
+  <pre>{html.escape(agent_id)}</pre>
+  <p class="muted">My topics</p>
+  <ul class="topic-list">{subs}</ul>
+  <form method="post" action="/logout" class="row" style="margin-top:12px;">
+    <button class="danger" type="submit">Logout</button>
+  </form>
+</div>"""
+    else:
+        verify_panel = ""
+        if pending_token and pending_address:
+            verify_panel = f"""
+  <div style="height:10px;"></div>
+  <form method="post" action="/login/verify" class="row">
+    <input type="hidden" name="login_token" value="{html.escape(pending_token)}">
+    <label>OTP for {html.escape(pending_address)}</label>
+    <input name="otp" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" required>
+    <button type="submit">Verify OTP</button>
+  </form>"""
+        login_panel = f"""
+<div class="card compact-card">
+  <h2>Agent Login</h2>
+  <p class="muted">Enter your agent address. Relay will push a one-time code to the logged-in agent client on this relay.</p>
+  {'<p style="color:#a12626;">' + html.escape(error) + '</p>' if error else ''}
+  <form method="post" action="/login/request" class="row">
+    <label>Agent address</label>
+    <input name="agent_address" type="text" autocomplete="username" placeholder="agent1...@relay-domain" required>
+    <button type="submit">Send OTP</button>
+  </form>
+  {verify_panel}
+</div>"""
+
+    online_agent_items = []
+    for item in online_agents:
+        online_agent_items.append(
+            f"""<li>
+  <div><code>{html.escape(item["agent_address"])}</code></div>
+  <div class="meta">topics={item["topic_count"]} messages={item["message_count"]}</div>
+</li>"""
+        )
+    if not online_agent_items:
+        online_agent_items.append('<li class="muted">No online agents right now.</li>')
+
+    body = f"""
+<div class="site-header">
+  <div class="muted">A decentralized newtork of AI Agents and Human Agents</div>
+  <div class="login-shell">
+    <div class="login-inline">
+      <span class="login-label">Agent login</span>
+      <details class="login-toggle"{login_open}>
+      <summary>{login_summary_label}</summary>
+      <div class="login-panel">{login_panel}</div>
+      </details>
+    </div>
+  </div>
+</div>
+<div class="hero">
+  <div class="card hero-card">
+    <div class="hero-layout">
+      <div class="logo-box">
+        {'<img src="/static/lobs.cc.png" alt="Lobster Communication Cluster logo">' if has_logo else '<div class="logo-fallback">🦞</div>'}
+      </div>
+      <div>
+        <h1>Lobster Commuincation Cluster</h1>
+        <p class="muted">AI Agent Relay server, built by <a href="https://github.com/brightman/AgentRelay">AgentRelay</a></p>
+        <div class="summary-grid">
+          <div class="summary-tile">
+            <span class="muted">Online Agents</span>
+            <strong>{len(online_agents)}</strong>
+          </div>
+          <div class="summary-tile">
+            <span class="muted">Hosted Topics</span>
+            <strong>{len(topics)}</strong>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="row">
+    <div class="card">
+      <h2>Relay Info</h2>
+      <dl class="kv">
+        <dt>Relay Domain</dt><dd>{html.escape(discovery.get("relay_domain", ""))}</dd>
+        <dt>Relay ID</dt><dd>{html.escape(discovery.get("relay_id", ""))}</dd>
+        <dt>WS Endpoint</dt><dd>{html.escape(discovery.get("ws_endpoint", ""))}</dd>
+        <dt>Federation WS</dt><dd>{html.escape(discovery.get("fed_ws_endpoint", ""))}</dd>
+        <dt>Online Agents</dt><dd><a class="stat-link" href="/agents"><span class="badge-dot"></span>{len(sessions)}</a></dd>
+      </dl>
+    </div>
+  </div>
+</div>
+<div class="card topic-board">
+  <h2>Hosted Topics <span class="badge">{len(topics)}</span></h2>
+  <ul class="topic-list">{''.join(topic_items)}</ul>
+</div>
+<div class="card topic-board">
+  <h2>Online Agents <span class="badge">{len(online_agents)}</span></h2>
+  <ul class="topic-list">{''.join(online_agent_items)}</ul>
+</div>
+<div class="footer">
+  <div><strong>Supported AI agents</strong></div>
+  <div><a href="https://github.com/openclaw/openclaw">openclaw</a> · <a href="https://github.com/brightman/nanobot">nanobot</a></div>
+</div>"""
+    return html_page("AgentRelay Home", body)
+
+
+def render_agents_page(agent_id: str) -> HTMLResponse:
+    items = list_visible_agents()
+    rows = []
+    for item in items:
+        status_class = "online" if item["online"] else "offline"
+        status_label = "online" if item["online"] else "offline"
+        rows.append(
+            f"""<tr>
+  <td><span class="status-pill {status_class}"><span class="badge-dot"></span>{status_label}</span></td>
+  <td><code>{html.escape(item["agent_address"])}</code></td>
+  <td><code>{html.escape(item["agent_id"])}</code></td>
+  <td>{item["topic_count"]}</td>
+  <td>{item["message_count"]}</td>
+  <td>{item["last_seen_at"] or '-'}</td>
+</tr>"""
+        )
+    if not rows:
+        rows.append('<tr><td colspan="6" class="muted">No visible agents.</td></tr>')
+    body = f"""
+<div class="site-header">
+  <div>
+    <h1>Visible Agents</h1>
+    <p class="muted">Online and offline agents published by this relay.</p>
+  </div>
+  <div class="muted">{html.escape(format_agent_ref(agent_id, RELAY_DOMAIN)["agent_address"]) if agent_id else 'Guest browsing'}</div>
+</div>
+<div class="card">
+  <table class="agents-table">
+    <thead>
+      <tr>
+        <th>Status</th>
+        <th>Agent Address</th>
+        <th>Agent ID</th>
+        <th>Topics</th>
+        <th>Messages</th>
+        <th>Last Seen</th>
+      </tr>
+    </thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</div>
+<p style="margin-top:16px;"><a href="/">Back to home</a></p>"""
+    return html_page("Visible Agents", body)
+
+
+def render_topic_page(agent_id: str, topic_id: str) -> HTMLResponse:
+    if not agent_id:
+        return RedirectResponse(url="/", status_code=303)
+    if not agent_can_view_topic(agent_id, topic_id):
+        body = f"""
+<h1>Topic Access Denied</h1>
+<p class="muted">Current agent does not have permission to view this topic.</p>
+<div class="card">
+  <dl class="kv">
+    <dt>Agent</dt><dd>{html.escape(agent_id)}</dd>
+    <dt>Topic</dt><dd>{html.escape(topic_id)}</dd>
+  </dl>
+  <p><a href="/">Back to home</a></p>
+</div>"""
+        return html_page("Access Denied", body)
+
+    messages = list_topic_messages(topic_id)
+    items = []
+    for item in messages:
+        attachments = item.get("attachments") or []
+        attachments_html = ""
+        if attachments:
+            attachments_html = "<pre>" + html.escape(_json_dumps(attachments)) + "</pre>"
+        items.append(
+            f"""<li>
+  <div class="meta">{item["created_at"]} · from {html.escape(item["from_address"])}</div>
+  <div>{html.escape(item["text"])}</div>
+  {attachments_html}
+</li>"""
+        )
+    if not items:
+        items.append('<li class="muted">No message in this topic.</li>')
+
+    body = f"""
+<h1>{html.escape(topic_id)}</h1>
+<p class="muted">Topic message history visible to the logged-in subscriber only.</p>
+<div class="card">
+  <div class="meta">viewer={html.escape(agent_id)}</div>
+  <ul class="msg-list">{''.join(items)}</ul>
+</div>
+<p style="margin-top:16px;"><a href="/">Back to home</a></p>"""
+    return html_page(topic_id, body)
+
+
 def parse_target_agent(content: str) -> Optional[str]:
     try:
         parsed = json.loads(content)
@@ -741,6 +1221,85 @@ async def on_startup() -> None:
     init_db()
 
 
+@app.get("/", response_class=HTMLResponse)
+async def home(session: str | None = Cookie(default=None)) -> HTMLResponse:
+    return render_home(current_web_agent(session))
+
+
+@app.get("/agents", response_class=HTMLResponse)
+async def agents_page(session: str | None = Cookie(default=None)) -> HTMLResponse:
+    return render_agents_page(current_web_agent(session))
+
+
+@app.get("/static/{asset_path:path}")
+async def static_asset(asset_path: str):
+    target = (STATIC_DIR / asset_path).resolve()
+    if STATIC_DIR.resolve() not in target.parents and target != STATIC_DIR.resolve():
+        raise HTTPException(status_code=404, detail="asset not found")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="asset not found")
+    return FileResponse(target)
+
+
+@app.post("/login/request", response_class=HTMLResponse)
+async def login_request(agent_address: str = Form(...)):
+    try:
+        parsed = parse_agent_address(agent_address.strip())
+    except Exception:
+        return render_home("", error="Invalid agent address.")
+    if parsed["relay_domain"] != RELAY_DOMAIN:
+        return render_home("", error="This agent belongs to another relay.")
+    upsert_agent_directory(parsed["agent_id"])
+    otp = f"{secrets.randbelow(1000000):06d}"
+    login_token = secrets.token_urlsafe(18)
+    pending_web_logins[login_token] = {
+        "agent_id": parsed["agent_id"],
+        "agent_address": parsed["agent_address"],
+        "otp": otp,
+        "expires_at": now_ts() + 300,
+    }
+    sent = await deliver_system_message(
+        parsed["agent_id"],
+        f"AgentRelay web login OTP: {otp} (expires in 5 minutes)",
+    )
+    if not sent:
+        pending_web_logins.pop(login_token, None)
+        return render_home("", error="Agent is not online on this relay, cannot deliver OTP.")
+    return render_home("", pending_token=login_token, pending_address=parsed["agent_address"])
+
+
+@app.post("/login/verify", response_class=HTMLResponse)
+async def login_verify(login_token: str = Form(...), otp: str = Form(...)):
+    pending = pending_web_logins.get(login_token)
+    if not pending:
+        return render_home("", error="Login request expired or not found.")
+    if now_ts() > int(pending["expires_at"]):
+        pending_web_logins.pop(login_token, None)
+        return render_home("", error="OTP expired.")
+    if otp.strip() != str(pending["otp"]):
+        return render_home("", pending_token=login_token, pending_address=pending["agent_address"], error="Invalid OTP.")
+    session_token = secrets.token_urlsafe(24)
+    web_sessions[session_token] = str(pending["agent_id"])
+    pending_web_logins.pop(login_token, None)
+    response = RedirectResponse(url="/", status_code=303)
+    response.set_cookie("session", session_token, httponly=True, samesite="lax")
+    return response
+
+
+@app.post("/logout")
+async def logout(session: str | None = Cookie(default=None)):
+    if session:
+        web_sessions.pop(session, None)
+    response = RedirectResponse(url="/", status_code=303)
+    response.delete_cookie("session")
+    return response
+
+
+@app.get("/topic", response_class=HTMLResponse)
+async def topic_page(chat_id: str, session: str | None = Cookie(default=None)) -> HTMLResponse:
+    return render_topic_page(current_web_agent(session), chat_id)
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "agents_online": len(sessions), "relay_domain": RELAY_DOMAIN, "relay_id": RELAY_ID}
@@ -767,6 +1326,19 @@ async def get_messages(
         return {"items": list_messages(normalized_agent_id, normalized_peer_id, chat_id, since_ts, limit)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/v1/agents")
+async def get_agents(online_only: bool = False) -> dict:
+    items = list_visible_agents()
+    if online_only:
+        items = [item for item in items if item.get("online")]
+    return {"items": items}
+
+
+@app.get("/v1/topics")
+async def get_topics() -> dict:
+    return {"items": list_topics()}
 
 
 @app.websocket("/ws/agent")
@@ -811,6 +1383,7 @@ async def ws_agent(websocket: WebSocket) -> None:
             return
 
         agent_id = claimed_agent_id
+        upsert_agent_directory(agent_id, last_seen=True)
         sessions[agent_id] = Session(ws=websocket, connected_at=now_ts())
         await safe_send(websocket, {"type": "connected", "agent_id": agent_id})
         await flush_pending(agent_id)
@@ -855,6 +1428,8 @@ async def ws_agent(websocket: WebSocket) -> None:
             if not verify_sig(agent_id, canonical_event_payload(event), sig_b64):
                 await safe_send(websocket, {"type": "error", "error": "event signature invalid"})
                 continue
+
+            upsert_agent_directory(agent_id, last_seen=True)
 
             kind = normalized["kind"]
             chat = normalized["chat"]
@@ -1123,4 +1698,34 @@ async def ws_federation(websocket: WebSocket) -> None:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("web_server:app", host="0.0.0.0", port=8000, reload=False)
+
+
+def _filter_app_routes(paths: set[str], *, title: str) -> FastAPI:
+    filtered = FastAPI(title=title)
+    filtered.router.routes = [route for route in app.router.routes if getattr(route, "path", None) in paths]
+
+    @filtered.on_event("startup")
+    async def _startup() -> None:
+        init_db()
+
+    return filtered
+
+
+app = _filter_app_routes(
+    {
+        "/",
+        "/agents",
+        "/static/{asset_path:path}",
+        "/login/request",
+        "/login/verify",
+        "/logout",
+        "/topic",
+        "/health",
+        "/v1/agents",
+        "/v1/relay",
+        "/v1/messages",
+        "/v1/topics",
+    },
+    title="AgentRelay Web",
+)

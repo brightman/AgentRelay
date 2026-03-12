@@ -36,6 +36,9 @@ PY
 
 pick_python_for() {
   local candidates=()
+  if [[ -x "$ROOT_DIR/../.venv/bin/python" ]]; then
+    candidates+=("$ROOT_DIR/../.venv/bin/python")
+  fi
   if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
     candidates+=("$ROOT_DIR/.venv/bin/python")
   fi
@@ -233,9 +236,9 @@ PY
 }
 
 choose_profile() {
-  echo "Profile:"
-  echo "  1) default"
-  echo "  2) manual input"
+  printf '%s\n' "Profile:" >&2
+  printf '%s\n' "  1) default" >&2
+  printf '%s\n' "  2) manual input" >&2
   read -r -p "Choose [1/2, default 1]: " profile
   echo "${profile:-1}"
 }
@@ -246,6 +249,8 @@ Usage:
   manage.sh menu
   manage.sh server [--profile default|manual|1|2] [--host HOST] [--port PORT] [--mode full|demo|1|2] [--allow A:B,C:D]
   manage.sh server-stop
+  manage.sh web [--host HOST] [--port PORT]
+  manage.sh web-stop
   manage.sh client [--profile default|manual|1|2] [--base-ws WS_URL] [--private-key HEX]
                    [--chat-type dm|topic] [--peer-id AGENT_ID] [--topic TOPIC] [--chat-id CHAT_ID]
                    [--mode interactive|send|subscribe|unsubscribe|1|2|3|4] [--message TEXT]
@@ -332,7 +337,7 @@ start_agentrelay_server() {
     port="${port:-$DEFAULT_SERVER_PORT}"
     if [[ -z "$mode" ]]; then
       echo "Choose server mode:"
-      echo "  1) full (server.py, FastAPI)"
+      echo "  1) full (agent_relay.py, FastAPI)"
       echo "  2) demo (ws_server_demo.py, lightweight)"
       read -r -p "Mode [1/2, default 2]: " mode
     fi
@@ -351,7 +356,7 @@ start_agentrelay_server() {
     fi
     echo "Starting AgentRelay server on ${host}:${port} with $py"
     cd "$ROOT_DIR"
-    exec "$py" -m uvicorn server:app --host "$host" --port "$port"
+    exec "$py" -m uvicorn agent_relay:app --host "$host" --port "$port"
   else
     if ! py="$(pick_python_for nacl websockets)"; then
       echo "No Python runtime with nacl+websockets found."
@@ -368,11 +373,50 @@ start_agentrelay_server() {
   fi
 }
 
+start_web_server() {
+  local host port py arg
+  host=""
+  port=""
+
+  while [[ $# -gt 0 ]]; do
+    arg="$1"
+    case "$arg" in
+      --host)
+        host="${2:-}"
+        shift 2
+        ;;
+      --port)
+        port="${2:-}"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown web option: $arg"
+        usage
+        exit 1
+        ;;
+    esac
+  done
+
+  host="${host:-$DEFAULT_SERVER_HOST}"
+  port="${port:-8780}"
+  if ! py="$(pick_python_for fastapi uvicorn)"; then
+    echo "No Python runtime with fastapi+uvicorn found."
+    exit 1
+  fi
+  echo "Starting AgentRelay web on ${host}:${port} with $py"
+  cd "$ROOT_DIR"
+  exec "$py" -m uvicorn web_server:app --host "$host" --port "$port"
+}
+
 stop_agentrelay_server() {
   local pids
   pids="$(
     ps -ax -o pid= -o command= | awk -v root="$ROOT_DIR" '
-      index($0, root "/server.py") || index($0, root "/ws_server_demo.py") {
+      index($0, root "/server.py") || index($0, root "/agent_relay.py") || index($0, root "/web_server.py") || index($0, root "/ws_server_demo.py") {
         print $1
       }
     '
@@ -385,6 +429,25 @@ stop_agentrelay_server() {
 
   echo "Stopping AgentRelay server process(es): $pids"
   # Send SIGTERM first so the server can shut down cleanly.
+  kill $pids
+}
+
+stop_web_server() {
+  local pids
+  pids="$(
+    ps -ax -o pid= -o command= | awk -v root="$ROOT_DIR" '
+      index($0, root "/web_server.py") {
+        print $1
+      }
+    '
+  )"
+
+  if [[ -z "${pids//[[:space:]]/}" ]]; then
+    echo "No AgentRelay web process found for $ROOT_DIR"
+    return 0
+  fi
+
+  echo "Stopping AgentRelay web process(es): $pids"
   kill $pids
 }
 
@@ -678,7 +741,8 @@ show_config_and_acl() {
 
   echo "AgentRelay Paths"
   echo "project_root: $ROOT_DIR"
-  echo "server_file : $ROOT_DIR/server.py"
+  echo "relay_file  : $ROOT_DIR/agent_relay.py"
+  echo "web_file    : $ROOT_DIR/web_server.py"
   echo "config_file : $CONFIG_PATH"
   echo "nanobot_cfg: $NANOBOT_CONFIG_PATH"
   echo "db_path     : $DB_PATH"
@@ -750,17 +814,21 @@ menu() {
   echo "AgentRelay Manage"
   echo "1) Start AgentRelay Server"
   echo "2) Stop AgentRelay Server"
-  echo "3) Start agent_client"
-  echo "4) Create new Agent and print config"
-  echo "5) Show AgentRelay config and ACL info"
-  read -r -p "Choose [1-5]: " choice
+  echo "3) Start AgentRelay Web"
+  echo "4) Stop AgentRelay Web"
+  echo "5) Start agent_client"
+  echo "6) Create new Agent and print config"
+  echo "7) Show AgentRelay config and ACL info"
+  read -r -p "Choose [1-7]: " choice
 
   case "$choice" in
     1) start_agentrelay_server ;;
     2) stop_agentrelay_server ;;
-    3) start_agent_client ;;
-    4) create_new_agent ;;
-    5) show_config_and_acl ;;
+    3) start_web_server ;;
+    4) stop_web_server ;;
+    5) start_agent_client ;;
+    6) create_new_agent ;;
+    7) show_config_and_acl ;;
     *) echo "Invalid option: $choice"; exit 1 ;;
   esac
 }
@@ -771,12 +839,17 @@ case "${1:-menu}" in
     start_agentrelay_server "$@"
     ;;
   2|server-stop|stop-server) stop_agentrelay_server ;;
-  3|client)
+  3|web)
+    shift
+    start_web_server "$@"
+    ;;
+  4|web-stop|stop-web) stop_web_server ;;
+  5|client)
     shift
     start_agent_client "$@"
     ;;
-  4|new-agent) create_new_agent ;;
-  5|info) show_config_and_acl ;;
+  6|new-agent) create_new_agent ;;
+  7|info) show_config_and_acl ;;
   menu)
     shift || true
     menu
