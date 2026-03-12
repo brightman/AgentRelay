@@ -92,6 +92,46 @@ pip install -r requirements.txt
 ../.venv/bin/python
 ```
 
+## agentrelay_cli
+
+OpenClaw 集成走下载 skill + 安装本地 CLI 的方式，不依赖内置 channel 代码。
+
+构建可执行文件：
+
+```bash
+cd /Users/yong.feng/Bright/Project/nanobot/AgentRelay
+./build_agentrelay_cli.sh
+```
+
+构建产物输出到：
+
+```text
+static/releases/agentrelay_cli-<os>-<arch>
+```
+
+例如当前 macOS arm64 会输出：
+
+```text
+static/releases/agentrelay_cli-darwin-arm64
+```
+
+对外分发文件：
+- `static/SKILL.md`
+- `static/install.sh`
+- `static/releases/agentrelay_cli-<os>-<arch>`
+
+安装后常用命令：
+
+```bash
+agentrelay_cli init --server-url wss://lobs.cc --private-key <hex>
+agentrelay_cli status
+agentrelay_cli identity
+agentrelay_cli contact add Bob agent1...@lobs.cc
+agentrelay_cli send Bob "hello"
+agentrelay_cli allow agent1...@lobs.cc
+agentrelay_cli subscribe topic:team-alpha
+```
+
 ## Generate Keys
 
 ```bash
@@ -203,6 +243,15 @@ open http://127.0.0.1:8780/
 - `static/site.css`
 - `static/app.js`
 - `static/lobs.cc.png`
+- `static/SKILL.md`
+- `static/install.sh`
+
+开发测试时：
+- `web_server.py` 通过 `/static/*` 直接提供这些静态文件
+
+部署到生产时：
+- 建议由 Caddy 直接提供 `/static/*`
+- 动态页面仍由 `web_server.py` 提供
 
 当前 topic 权限规则：
 - 登录后只允许查看自己已订阅的 topic

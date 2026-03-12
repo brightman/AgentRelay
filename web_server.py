@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import Cookie, FastAPI, Form, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from nacl.encoding import HexEncoder
 from nacl.signing import SigningKey, VerifyKey
@@ -964,12 +964,12 @@ def render_home(
         my_topics=list_agent_topics(agent_id) if agent_id else [],
         has_logo=has_logo,
         online_agents_count=len(online_agents),
-        topics_count=len(topics),
         relay_domain=discovery.get("relay_domain", ""),
         relay_id=discovery.get("relay_id", ""),
         ws_endpoint=discovery.get("ws_endpoint", ""),
         fed_ws_endpoint=discovery.get("fed_ws_endpoint", ""),
         relay_online_agents_count=count_online_agents(),
+        topics_count=len(topics),
         topics=topics,
         online_agents=online_agents,
     )
@@ -1166,7 +1166,12 @@ async def static_asset(asset_path: str):
         raise HTTPException(status_code=404, detail="asset not found")
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="asset not found")
-    return FileResponse(target)
+    media_type = None
+    if target.suffix == ".md":
+        media_type = "text/markdown; charset=utf-8"
+    elif target.suffix == ".sh":
+        media_type = "text/x-shellscript; charset=utf-8"
+    return FileResponse(target, media_type=media_type)
 
 
 @app.post("/login/request", response_class=HTMLResponse)

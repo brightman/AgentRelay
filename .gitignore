@@ -1,5 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+build/
+dist/
+*.spec
 channel.db
 server_config.json
