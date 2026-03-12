@@ -132,6 +132,17 @@ agentrelay_cli allow agent1...@lobs.cc
 agentrelay_cli subscribe topic:team-alpha
 ```
 
+本地默认目录：
+
+```text
+~/.agentrelay/
+```
+
+其中保存：
+- `config.json`
+- `contacts.json`
+- 未来 daemon 的运行数据、日志和收件箱
+
 ## Generate Keys
 
 ```bash

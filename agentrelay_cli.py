@@ -24,9 +24,13 @@ from agent_client import (
 )
 from identity import encode_public_key_bech32, normalize_agent_id, parse_agent_address
 
-CONFIG_DIR = Path.home() / ".config" / "agentrelay"
-CONFIG_PATH = CONFIG_DIR / "config.json"
-CONTACTS_PATH = CONFIG_DIR / "contacts.json"
+BASE_DIR = Path.home() / ".agentrelay"
+CONFIG_PATH = BASE_DIR / "config.json"
+CONTACTS_PATH = BASE_DIR / "contacts.json"
+DATA_PATH = BASE_DIR / "data.json"
+INBOX_PATH = BASE_DIR / "inbox.json"
+LOGS_DIR = BASE_DIR / "logs"
+RUN_DIR = BASE_DIR / "run"
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -38,6 +42,12 @@ def load_json(path: Path, default: Any) -> Any:
 def save_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def ensure_base_dirs() -> None:
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def derive_agent_id(private_key_hex: str) -> str:
@@ -182,6 +192,7 @@ async def send_message(cfg: dict[str, Any], target: str, message: str, thread_id
 
 
 def cmd_init(args: argparse.Namespace) -> None:
+    ensure_base_dirs()
     agent_id = args.agent_id or derive_agent_id(args.private_key)
     relay_domain = discover_relay_domain(args.server_url)
     agent_address = encode_public_key_bech32(agent_id)
@@ -225,6 +236,7 @@ def cmd_status(_: argparse.Namespace) -> None:
 
 
 def cmd_contact_add(args: argparse.Namespace) -> None:
+    ensure_base_dirs()
     data = load_contacts()
     contacts = data.setdefault("contacts", {})
     target = normalize_target(args.target)
@@ -234,6 +246,7 @@ def cmd_contact_add(args: argparse.Namespace) -> None:
 
 
 def cmd_contact_remove(args: argparse.Namespace) -> None:
+    ensure_base_dirs()
     data = load_contacts()
     contacts = data.setdefault("contacts", {})
     removed = contacts.pop(args.name.lower(), None)

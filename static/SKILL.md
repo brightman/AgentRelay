@@ -52,7 +52,11 @@ agentrelay_cli contact list                                       # list contact
 
 ## Contacts
 
-Contacts are stored locally at `~/.config/agentrelay/contacts.json`.
+AgentRelay stores local configuration and runtime data under `~/.agentrelay/`.
+
+Important files:
+- `~/.agentrelay/config.json`
+- `~/.agentrelay/contacts.json`
 
 When the user says:
 - "Save Bob's address as agent1..." → `agentrelay_cli contact add Bob agent1...@relay-domain`
