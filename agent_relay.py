@@ -105,7 +105,7 @@ def relay_directory_base(relay_domain: str) -> str:
 
 def fetch_remote_relay_discovery(relay_domain: str) -> dict[str, Any]:
     base = relay_directory_base(relay_domain)
-    with urllib.request.urlopen(f"{base}/v1/relay", timeout=3) as resp:
+    with urllib.request.urlopen(f"{base}/api/relay", timeout=3) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     if payload.get("relay_domain") != relay_domain:
         raise ValueError("relay discovery domain mismatch")
@@ -296,6 +296,20 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS topics (
+                topic_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                visibility TEXT NOT NULL DEFAULT 'public',
+                join_mode TEXT NOT NULL DEFAULT 'open',
+                owner_agent_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS agent_directory (
                 agent_id TEXT PRIMARY KEY,
                 agent_address TEXT NOT NULL,
@@ -304,6 +318,16 @@ def init_db() -> None:
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 last_seen_at INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_presence (
+                agent_id TEXT PRIMARY KEY,
+                online INTEGER NOT NULL DEFAULT 0,
+                connected_at INTEGER,
+                last_seen_at INTEGER NOT NULL
             )
             """
         )
@@ -395,6 +419,22 @@ def set_topic_subscription(topic: str, agent_id: str, subscribed: bool, event_id
     conn = sqlite3.connect(DB_PATH)
     try:
         if subscribed:
+            title = topic.split(":", 1)[1] if ":" in topic else topic
+            ts = now_ts()
+            conn.execute(
+                """
+                INSERT INTO topics(topic_id, title, description, visibility, join_mode, owner_agent_id, created_at, updated_at)
+                VALUES(?, ?, '', 'public', 'open', ?, ?, ?)
+                ON CONFLICT(topic_id) DO UPDATE SET
+                    title=CASE WHEN topics.title = '' THEN excluded.title ELSE topics.title END,
+                    owner_agent_id=CASE
+                        WHEN topics.owner_agent_id IS NULL OR topics.owner_agent_id = '' THEN excluded.owner_agent_id
+                        ELSE topics.owner_agent_id
+                    END,
+                    updated_at=excluded.updated_at
+                """,
+                (topic, title, agent_id, ts, ts),
+            )
             conn.execute(
                 """
                 INSERT INTO topic_subscriptions(topic, agent_id, created_at, updated_by_event_id)
@@ -647,10 +687,16 @@ def list_topics() -> list[dict[str, Any]]:
             )
             SELECT
                 k.topic_id,
+                COALESCE(t.title, CASE WHEN instr(k.topic_id, ':') > 0 THEN substr(k.topic_id, instr(k.topic_id, ':') + 1) ELSE k.topic_id END) AS title,
+                COALESCE(t.description, '') AS description,
+                COALESCE(t.visibility, 'public') AS visibility,
+                COALESCE(t.join_mode, 'open') AS join_mode,
+                COALESCE(t.owner_agent_id, '') AS topic_owner_id,
                 COALESCE(m.message_count, 0) AS message_count,
                 COALESCE(s.subscriber_count, 0) AS subscriber_count,
                 COALESCE(m.last_created_at, 0) AS last_created_at
             FROM known_topics k
+            LEFT JOIN topics t ON t.topic_id = k.topic_id
             LEFT JOIN (
                 SELECT chat_id, COUNT(*) AS message_count, MAX(created_at) AS last_created_at
                 FROM messages_v2
@@ -662,11 +708,19 @@ def list_topics() -> list[dict[str, Any]]:
                 FROM topic_subscriptions
                 GROUP BY topic
             ) s ON s.topic = k.topic_id
-            ORDER BY last_created_at DESC, topic_id ASC
+            ORDER BY last_created_at DESC, k.topic_id ASC
             """,
             (TOPIC_CHAT_TYPE, TOPIC_CHAT_TYPE),
         ).fetchall()
-        return [dict(row) for row in rows]
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            owner_id = item.get("topic_owner_id") or ""
+            item["topic_owner_address"] = format_agent_ref(owner_id, RELAY_DOMAIN)["agent_address"] if owner_id else ""
+            item["can_subscribe_directly"] = item["visibility"] == "public" and item["join_mode"] == "open"
+            item["can_request_join"] = item["join_mode"] == "approval_required"
+            items.append(item)
+        return items
     finally:
         conn.close()
 
@@ -733,6 +787,38 @@ def upsert_agent_directory(agent_id: str, *, last_seen: bool = False) -> None:
         conn.close()
 
 
+def set_agent_presence(agent_id: str, online: bool) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        ts = now_ts()
+        conn.execute(
+            """
+            INSERT INTO agent_presence(agent_id, online, connected_at, last_seen_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                online=excluded.online,
+                connected_at=CASE
+                    WHEN excluded.online = 1 THEN excluded.connected_at
+                    ELSE agent_presence.connected_at
+                END,
+                last_seen_at=excluded.last_seen_at
+            """,
+            (agent_id, 1 if online else 0, ts if online else None, ts),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def count_online_agents() -> int:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM agent_presence WHERE online=1").fetchone()
+        return int(row[0] if row else 0)
+    finally:
+        conn.close()
+
+
 def list_visible_agents() -> list[dict[str, Any]]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -759,10 +845,12 @@ def list_visible_agents() -> list[dict[str, Any]]:
                 COALESCE(ad.agent_address, '') AS agent_address,
                 COALESCE(ad.visible, 1) AS visible,
                 ad.last_seen_at,
+                COALESCE(ap.online, 0) AS online,
                 COALESCE(ts.topic_count, 0) AS topic_count,
                 COALESCE(msg.message_count, 0) AS message_count
             FROM discovered d
             LEFT JOIN agent_directory ad ON ad.agent_id = d.agent_id
+            LEFT JOIN agent_presence ap ON ap.agent_id = d.agent_id
             LEFT JOIN (
                 SELECT agent_id, COUNT(*) AS topic_count
                 FROM topic_subscriptions
@@ -782,7 +870,7 @@ def list_visible_agents() -> list[dict[str, Any]]:
             item = dict(row)
             if not item["agent_address"]:
                 item["agent_address"] = format_agent_ref(item["agent_id"], RELAY_DOMAIN)["agent_address"]
-            item["online"] = item["agent_id"] in sessions
+            item["online"] = bool(item["online"])
             items.append(item)
         return items
     finally:
@@ -1434,15 +1522,15 @@ async def topic_page(chat_id: str, session: str | None = Cookie(default=None)) -
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True, "agents_online": len(sessions), "relay_domain": RELAY_DOMAIN, "relay_id": RELAY_ID}
+    return {"ok": True, "agents_online": count_online_agents(), "relay_domain": RELAY_DOMAIN, "relay_id": RELAY_ID}
 
 
-@app.get("/v1/relay")
+@app.get("/api/relay")
 async def get_relay_info() -> dict:
     return relay_discovery_payload()
 
 
-@app.get("/v1/messages")
+@app.get("/api/messages")
 async def get_messages(
     agent_id: str,
     peer_id: str = "",
@@ -1460,7 +1548,7 @@ async def get_messages(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/v1/agents")
+@app.get("/api/agents")
 async def get_agents(online_only: bool = False) -> dict:
     items = list_visible_agents()
     if online_only:
@@ -1468,7 +1556,7 @@ async def get_agents(online_only: bool = False) -> dict:
     return {"items": items}
 
 
-@app.get("/v1/topics")
+@app.get("/api/topics")
 async def get_topics() -> dict:
     return {"items": list_topics()}
 
@@ -1516,6 +1604,7 @@ async def ws_agent(websocket: WebSocket) -> None:
 
         agent_id = claimed_agent_id
         upsert_agent_directory(agent_id, last_seen=True)
+        set_agent_presence(agent_id, True)
         sessions[agent_id] = Session(ws=websocket, connected_at=now_ts())
         await safe_send(websocket, {"type": "connected", "agent_id": agent_id})
         await flush_pending(agent_id)
@@ -1665,6 +1754,7 @@ async def ws_agent(websocket: WebSocket) -> None:
     finally:
         if agent_id and sessions.get(agent_id) and sessions[agent_id].ws is websocket:
             sessions.pop(agent_id, None)
+            set_agent_presence(agent_id, False)
 
 
 @app.websocket("/ws/federation")
@@ -1847,10 +1937,6 @@ def _filter_app_routes(paths: set[str], *, title: str) -> FastAPI:
 app = _filter_app_routes(
     {
         "/health",
-        "/v1/agents",
-        "/v1/relay",
-        "/v1/messages",
-        "/v1/topics",
         "/ws/agent",
         "/ws/federation",
     },

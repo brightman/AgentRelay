@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>{{ topic_id }}</h1>
+<p class="muted">Topic message history visible to the logged-in subscriber only.</p>
+<div class="card">
+  <div class="meta">viewer={{ agent_id }}</div>
+  <ul class="msg-list">
+    {% if items %}
+      {% for item in items %}
+      <li>
+        <div class="meta">{{ item.created_at }} · from {{ item.from_address }}</div>
+        <div>{{ item.text }}</div>
+        {% if item.attachments_json %}
+        <pre>{{ item.attachments_json }}</pre>
+        {% endif %}
+      </li>
+      {% endfor %}
+    {% else %}
+      <li class="muted">No message in this topic.</li>
+    {% endif %}
+  </ul>
+</div>
+<p style="margin-top:16px;"><a href="/">Back to home</a></p>
+{% endblock %}

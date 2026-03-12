@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import Cookie, FastAPI, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from jinja2 import Environment, FileSystemLoader, select_autoescape
 from nacl.encoding import HexEncoder
 from nacl.signing import SigningKey, VerifyKey
 
@@ -20,7 +21,7 @@ from identity import format_agent_ref, normalize_agent_id, parse_agent_address
 
 DB_PATH = Path("channel.db")
 STATIC_DIR = Path("static")
-BASE_TEMPLATE_PATH = STATIC_DIR / "base.html"
+TEMPLATES_DIR = Path("templates")
 LOGO_PATH = STATIC_DIR / "lobs.cc.png"
 SYSTEM_CHAT_TYPE = "system"
 DM_CHAT_TYPE = "dm"
@@ -32,6 +33,10 @@ RELAY_FED_BASE = os.getenv("AGENTRELAY_FED_BASE", os.getenv("AGENTHUB_RELAY_FED_
 RELAY_PRIVATE_KEY_HEX = os.getenv("AGENTRELAY_PRIVATE_KEY", os.getenv("AGENTHUB_RELAY_PRIVATE_KEY", "")).strip()
 RELAY_DIRECTORY = json.loads(os.getenv("AGENTRELAY_DIRECTORY", os.getenv("AGENTHUB_RELAY_DIRECTORY", "{}")) or "{}")
 app = FastAPI(title="Signed AgentRelay Server")
+templates_env = Environment(
+    loader=FileSystemLoader(str(TEMPLATES_DIR)),
+    autoescape=select_autoescape(["html", "xml"]),
+)
 
 
 @dataclass
@@ -107,7 +112,7 @@ def relay_directory_base(relay_domain: str) -> str:
 
 def fetch_remote_relay_discovery(relay_domain: str) -> dict[str, Any]:
     base = relay_directory_base(relay_domain)
-    with urllib.request.urlopen(f"{base}/v1/relay", timeout=3) as resp:
+    with urllib.request.urlopen(f"{base}/api/relay", timeout=3) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     if payload.get("relay_domain") != relay_domain:
         raise ValueError("relay discovery domain mismatch")
@@ -298,6 +303,20 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS topics (
+                topic_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                visibility TEXT NOT NULL DEFAULT 'public',
+                join_mode TEXT NOT NULL DEFAULT 'open',
+                owner_agent_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS agent_directory (
                 agent_id TEXT PRIMARY KEY,
                 agent_address TEXT NOT NULL,
@@ -306,6 +325,16 @@ def init_db() -> None:
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 last_seen_at INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_presence (
+                agent_id TEXT PRIMARY KEY,
+                online INTEGER NOT NULL DEFAULT 0,
+                connected_at INTEGER,
+                last_seen_at INTEGER NOT NULL
             )
             """
         )
@@ -397,6 +426,22 @@ def set_topic_subscription(topic: str, agent_id: str, subscribed: bool, event_id
     conn = sqlite3.connect(DB_PATH)
     try:
         if subscribed:
+            title = topic.split(":", 1)[1] if ":" in topic else topic
+            ts = now_ts()
+            conn.execute(
+                """
+                INSERT INTO topics(topic_id, title, description, visibility, join_mode, owner_agent_id, created_at, updated_at)
+                VALUES(?, ?, '', 'public', 'open', ?, ?, ?)
+                ON CONFLICT(topic_id) DO UPDATE SET
+                    title=CASE WHEN topics.title = '' THEN excluded.title ELSE topics.title END,
+                    owner_agent_id=CASE
+                        WHEN topics.owner_agent_id IS NULL OR topics.owner_agent_id = '' THEN excluded.owner_agent_id
+                        ELSE topics.owner_agent_id
+                    END,
+                    updated_at=excluded.updated_at
+                """,
+                (topic, title, agent_id, ts, ts),
+            )
             conn.execute(
                 """
                 INSERT INTO topic_subscriptions(topic, agent_id, created_at, updated_by_event_id)
@@ -649,10 +694,16 @@ def list_topics() -> list[dict[str, Any]]:
             )
             SELECT
                 k.topic_id,
+                COALESCE(t.title, CASE WHEN instr(k.topic_id, ':') > 0 THEN substr(k.topic_id, instr(k.topic_id, ':') + 1) ELSE k.topic_id END) AS title,
+                COALESCE(t.description, '') AS description,
+                COALESCE(t.visibility, 'public') AS visibility,
+                COALESCE(t.join_mode, 'open') AS join_mode,
+                COALESCE(t.owner_agent_id, '') AS topic_owner_id,
                 COALESCE(m.message_count, 0) AS message_count,
                 COALESCE(s.subscriber_count, 0) AS subscriber_count,
                 COALESCE(m.last_created_at, 0) AS last_created_at
             FROM known_topics k
+            LEFT JOIN topics t ON t.topic_id = k.topic_id
             LEFT JOIN (
                 SELECT chat_id, COUNT(*) AS message_count, MAX(created_at) AS last_created_at
                 FROM messages_v2
@@ -664,11 +715,19 @@ def list_topics() -> list[dict[str, Any]]:
                 FROM topic_subscriptions
                 GROUP BY topic
             ) s ON s.topic = k.topic_id
-            ORDER BY last_created_at DESC, topic_id ASC
+            ORDER BY last_created_at DESC, k.topic_id ASC
             """,
             (TOPIC_CHAT_TYPE, TOPIC_CHAT_TYPE),
         ).fetchall()
-        return [dict(row) for row in rows]
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            owner_id = item.get("topic_owner_id") or ""
+            item["topic_owner_address"] = format_agent_ref(owner_id, RELAY_DOMAIN)["agent_address"] if owner_id else ""
+            item["can_subscribe_directly"] = item["visibility"] == "public" and item["join_mode"] == "open"
+            item["can_request_join"] = item["join_mode"] == "approval_required"
+            items.append(item)
+        return items
     finally:
         conn.close()
 
@@ -735,6 +794,38 @@ def upsert_agent_directory(agent_id: str, *, last_seen: bool = False) -> None:
         conn.close()
 
 
+def set_agent_presence(agent_id: str, online: bool) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        ts = now_ts()
+        conn.execute(
+            """
+            INSERT INTO agent_presence(agent_id, online, connected_at, last_seen_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                online=excluded.online,
+                connected_at=CASE
+                    WHEN excluded.online = 1 THEN excluded.connected_at
+                    ELSE agent_presence.connected_at
+                END,
+                last_seen_at=excluded.last_seen_at
+            """,
+            (agent_id, 1 if online else 0, ts if online else None, ts),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def count_online_agents() -> int:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM agent_presence WHERE online=1").fetchone()
+        return int(row[0] if row else 0)
+    finally:
+        conn.close()
+
+
 def list_visible_agents() -> list[dict[str, Any]]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -761,10 +852,12 @@ def list_visible_agents() -> list[dict[str, Any]]:
                 COALESCE(ad.agent_address, '') AS agent_address,
                 COALESCE(ad.visible, 1) AS visible,
                 ad.last_seen_at,
+                COALESCE(ap.online, 0) AS online,
                 COALESCE(ts.topic_count, 0) AS topic_count,
                 COALESCE(msg.message_count, 0) AS message_count
             FROM discovered d
             LEFT JOIN agent_directory ad ON ad.agent_id = d.agent_id
+            LEFT JOIN agent_presence ap ON ap.agent_id = d.agent_id
             LEFT JOIN (
                 SELECT agent_id, COUNT(*) AS topic_count
                 FROM topic_subscriptions
@@ -784,7 +877,7 @@ def list_visible_agents() -> list[dict[str, Any]]:
             item = dict(row)
             if not item["agent_address"]:
                 item["agent_address"] = format_agent_ref(item["agent_id"], RELAY_DOMAIN)["agent_address"]
-            item["online"] = item["agent_id"] in sessions
+            item["online"] = bool(item["online"])
             items.append(item)
         return items
     finally:
@@ -833,26 +926,9 @@ async def deliver_system_message(agent_id: str, content: str) -> bool:
     return await safe_send(session.ws, {"type": "deliver", "event": event, "sig": sig})
 
 
-def html_page(title: str, body: str) -> HTMLResponse:
-    if BASE_TEMPLATE_PATH.exists():
-        doc = BASE_TEMPLATE_PATH.read_text(encoding="utf-8")
-        doc = doc.replace("__TITLE__", html.escape(title))
-        doc = doc.replace("__BODY__", body)
-    else:
-        doc = f"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{html.escape(title)}</title>
-  <link rel="stylesheet" href="/static/site.css">
-</head>
-<body>
-  <div class="wrap">{body}</div>
-  <script src="/static/app.js"></script>
-</body>
-</html>"""
-    return HTMLResponse(doc)
+def html_page(template_name: str, **context: Any) -> HTMLResponse:
+    template = templates_env.get_template(template_name)
+    return HTMLResponse(template.render(**context))
 
 
 def render_home(
@@ -872,222 +948,74 @@ def render_home(
         localpart = logged_in_address.split("@", 1)[0]
         logged_in_short = f"{localpart[:10]}..." if len(localpart) > 10 else localpart
     has_logo = LOGO_PATH.exists()
-    topic_items = []
-    for topic in topics:
-        topic_id = html.escape(topic["topic_id"])
-        topic_items.append(
-            f"""<li>
-  <div><a href="/topic?chat_id={topic_id}">{topic_id}</a></div>
-  <div class="meta">messages={topic["message_count"]} subscribers={topic["subscriber_count"]}</div>
-</li>"""
-        )
-    if not topic_items:
-        topic_items.append('<li class="muted">No topic yet.</li>')
-
-    login_panel = ""
     login_summary_label = logged_in_short if agent_id else "Login"
-    login_open = " open" if (pending_token or error) else ""
-    if agent_id:
-        my_topics = list_agent_topics(agent_id)
-        subs = "".join(f"<li>{html.escape(topic)}</li>" for topic in my_topics) or '<li class="muted">No subscription.</li>'
-        login_panel = f"""
-<div class="card compact-card">
-  <h2>Agent Session</h2>
-  <p class="muted">Logged in as</p>
-  <pre>{html.escape(logged_in_address)}</pre>
-  <p class="muted">Agent ID</p>
-  <pre>{html.escape(agent_id)}</pre>
-  <p class="muted">My topics</p>
-  <ul class="topic-list">{subs}</ul>
-  <form method="post" action="/logout" class="row" style="margin-top:12px;">
-    <button class="danger" type="submit">Logout</button>
-  </form>
-</div>"""
-    else:
-        verify_panel = ""
-        if pending_token and pending_address:
-            verify_panel = f"""
-  <div style="height:10px;"></div>
-  <form method="post" action="/login/verify" class="row">
-    <input type="hidden" name="login_token" value="{html.escape(pending_token)}">
-    <label>OTP for {html.escape(pending_address)}</label>
-    <input name="otp" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" required>
-    <button type="submit">Verify OTP</button>
-  </form>"""
-        login_panel = f"""
-<div class="card compact-card">
-  <h2>Agent Login</h2>
-  <p class="muted">Enter your agent address. Relay will push a one-time code to the logged-in agent client on this relay.</p>
-  {'<p style="color:#a12626;">' + html.escape(error) + '</p>' if error else ''}
-  <form method="post" action="/login/request" class="row">
-    <label>Agent address</label>
-    <input name="agent_address" type="text" autocomplete="username" placeholder="agent1...@relay-domain" required>
-    <button type="submit">Send OTP</button>
-  </form>
-  {verify_panel}
-</div>"""
-
-    online_agent_items = []
-    for item in online_agents:
-        online_agent_items.append(
-            f"""<li>
-  <div><code>{html.escape(item["agent_address"])}</code></div>
-  <div class="meta">topics={item["topic_count"]} messages={item["message_count"]}</div>
-</li>"""
-        )
-    if not online_agent_items:
-        online_agent_items.append('<li class="muted">No online agents right now.</li>')
-
-    body = f"""
-<div class="site-header">
-  <div class="muted">A decentralized newtork of AI Agents and Human Agents</div>
-  <div class="login-shell">
-    <div class="login-inline">
-      <span class="login-label">Agent login</span>
-      <details class="login-toggle"{login_open}>
-      <summary>{login_summary_label}</summary>
-      <div class="login-panel">{login_panel}</div>
-      </details>
-    </div>
-  </div>
-</div>
-<div class="hero">
-  <div class="card hero-card">
-    <div class="hero-layout">
-      <div class="logo-box">
-        {'<img src="/static/lobs.cc.png" alt="Lobster Communication Cluster logo">' if has_logo else '<div class="logo-fallback">🦞</div>'}
-      </div>
-      <div>
-        <h1>Lobster Commuincation Cluster</h1>
-        <p class="muted">AI Agent Relay server, built by <a href="https://github.com/brightman/AgentRelay">AgentRelay</a></p>
-        <div class="summary-grid">
-          <div class="summary-tile">
-            <span class="muted">Online Agents</span>
-            <strong>{len(online_agents)}</strong>
-          </div>
-          <div class="summary-tile">
-            <span class="muted">Hosted Topics</span>
-            <strong>{len(topics)}</strong>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-  <div class="row">
-    <div class="card">
-      <h2>Relay Info</h2>
-      <dl class="kv">
-        <dt>Relay Domain</dt><dd>{html.escape(discovery.get("relay_domain", ""))}</dd>
-        <dt>Relay ID</dt><dd>{html.escape(discovery.get("relay_id", ""))}</dd>
-        <dt>WS Endpoint</dt><dd>{html.escape(discovery.get("ws_endpoint", ""))}</dd>
-        <dt>Federation WS</dt><dd>{html.escape(discovery.get("fed_ws_endpoint", ""))}</dd>
-        <dt>Online Agents</dt><dd><a class="stat-link" href="/agents"><span class="badge-dot"></span>{len(sessions)}</a></dd>
-      </dl>
-    </div>
-  </div>
-</div>
-<div class="card topic-board">
-  <h2>Hosted Topics <span class="badge">{len(topics)}</span></h2>
-  <ul class="topic-list">{''.join(topic_items)}</ul>
-</div>
-<div class="card topic-board">
-  <h2>Online Agents <span class="badge">{len(online_agents)}</span></h2>
-  <ul class="topic-list">{''.join(online_agent_items)}</ul>
-</div>
-<div class="footer">
-  <div><strong>Supported AI agents</strong></div>
-  <div><a href="https://github.com/openclaw/openclaw">openclaw</a> · <a href="https://github.com/brightman/nanobot">nanobot</a></div>
-</div>"""
-    return html_page("AgentRelay Home", body)
+    return html_page(
+        "home.html",
+        title="AgentRelay Home",
+        top_line_text="A decentralized newtork of AI Agents and Human Agents, built by",
+        logged_in=bool(agent_id),
+        logged_in_address=logged_in_address,
+        logged_in_short=logged_in_short,
+        login_summary_label=login_summary_label,
+        login_open=bool(pending_token or error),
+        login_error=error,
+        pending_token=pending_token,
+        pending_address=pending_address,
+        my_topics=list_agent_topics(agent_id) if agent_id else [],
+        has_logo=has_logo,
+        online_agents_count=len(online_agents),
+        topics_count=len(topics),
+        relay_domain=discovery.get("relay_domain", ""),
+        relay_id=discovery.get("relay_id", ""),
+        ws_endpoint=discovery.get("ws_endpoint", ""),
+        fed_ws_endpoint=discovery.get("fed_ws_endpoint", ""),
+        relay_online_agents_count=count_online_agents(),
+        topics=topics,
+        online_agents=online_agents,
+    )
 
 
 def render_agents_page(agent_id: str) -> HTMLResponse:
     items = list_visible_agents()
-    rows = []
-    for item in items:
-        status_class = "online" if item["online"] else "offline"
-        status_label = "online" if item["online"] else "offline"
-        rows.append(
-            f"""<tr>
-  <td><span class="status-pill {status_class}"><span class="badge-dot"></span>{status_label}</span></td>
-  <td><code>{html.escape(item["agent_address"])}</code></td>
-  <td><code>{html.escape(item["agent_id"])}</code></td>
-  <td>{item["topic_count"]}</td>
-  <td>{item["message_count"]}</td>
-  <td>{item["last_seen_at"] or '-'}</td>
-</tr>"""
-        )
-    if not rows:
-        rows.append('<tr><td colspan="6" class="muted">No visible agents.</td></tr>')
-    body = f"""
-<div class="site-header">
-  <div>
-    <h1>Visible Agents</h1>
-    <p class="muted">Online and offline agents published by this relay.</p>
-  </div>
-  <div class="muted">{html.escape(format_agent_ref(agent_id, RELAY_DOMAIN)["agent_address"]) if agent_id else 'Guest browsing'}</div>
-</div>
-<div class="card">
-  <table class="agents-table">
-    <thead>
-      <tr>
-        <th>Status</th>
-        <th>Agent Address</th>
-        <th>Agent ID</th>
-        <th>Topics</th>
-        <th>Messages</th>
-        <th>Last Seen</th>
-      </tr>
-    </thead>
-    <tbody>{''.join(rows)}</tbody>
-  </table>
-</div>
-<p style="margin-top:16px;"><a href="/">Back to home</a></p>"""
-    return html_page("Visible Agents", body)
+    return html_page(
+        "agents.html",
+        title="Visible Agents",
+        viewer=format_agent_ref(agent_id, RELAY_DOMAIN)["agent_address"] if agent_id else "Guest browsing",
+        items=items,
+    )
 
 
 def render_topic_page(agent_id: str, topic_id: str) -> HTMLResponse:
     if not agent_id:
         return RedirectResponse(url="/", status_code=303)
     if not agent_can_view_topic(agent_id, topic_id):
-        body = f"""
-<h1>Topic Access Denied</h1>
-<p class="muted">Current agent does not have permission to view this topic.</p>
-<div class="card">
-  <dl class="kv">
-    <dt>Agent</dt><dd>{html.escape(agent_id)}</dd>
-    <dt>Topic</dt><dd>{html.escape(topic_id)}</dd>
-  </dl>
-  <p><a href="/">Back to home</a></p>
-</div>"""
-        return html_page("Access Denied", body)
+        return html_page(
+            "topic_denied.html",
+            title="Access Denied",
+            agent_id=html.escape(agent_id),
+            topic_id=html.escape(topic_id),
+        )
 
     messages = list_topic_messages(topic_id)
-    items = []
+    rendered_messages = []
     for item in messages:
         attachments = item.get("attachments") or []
-        attachments_html = ""
-        if attachments:
-            attachments_html = "<pre>" + html.escape(_json_dumps(attachments)) + "</pre>"
-        items.append(
-            f"""<li>
-  <div class="meta">{item["created_at"]} · from {html.escape(item["from_address"])}</div>
-  <div>{html.escape(item["text"])}</div>
-  {attachments_html}
-</li>"""
+        rendered_messages.append(
+            {
+                "created_at": item["created_at"],
+                "from_address": item["from_address"],
+                "text": item["text"],
+                "attachments_json": _json_dumps(attachments) if attachments else "",
+            }
         )
-    if not items:
-        items.append('<li class="muted">No message in this topic.</li>')
 
-    body = f"""
-<h1>{html.escape(topic_id)}</h1>
-<p class="muted">Topic message history visible to the logged-in subscriber only.</p>
-<div class="card">
-  <div class="meta">viewer={html.escape(agent_id)}</div>
-  <ul class="msg-list">{''.join(items)}</ul>
-</div>
-<p style="margin-top:16px;"><a href="/">Back to home</a></p>"""
-    return html_page(topic_id, body)
+    return html_page(
+        "topic.html",
+        title=topic_id,
+        topic_id=topic_id,
+        agent_id=agent_id,
+        items=rendered_messages,
+    )
 
 
 def parse_target_agent(content: str) -> Optional[str]:
@@ -1302,15 +1230,15 @@ async def topic_page(chat_id: str, session: str | None = Cookie(default=None)) -
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True, "agents_online": len(sessions), "relay_domain": RELAY_DOMAIN, "relay_id": RELAY_ID}
+    return {"ok": True, "agents_online": count_online_agents(), "relay_domain": RELAY_DOMAIN, "relay_id": RELAY_ID}
 
 
-@app.get("/v1/relay")
+@app.get("/api/relay")
 async def get_relay_info() -> dict:
     return relay_discovery_payload()
 
 
-@app.get("/v1/messages")
+@app.get("/api/messages")
 async def get_messages(
     agent_id: str,
     peer_id: str = "",
@@ -1328,7 +1256,7 @@ async def get_messages(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.get("/v1/agents")
+@app.get("/api/agents")
 async def get_agents(online_only: bool = False) -> dict:
     items = list_visible_agents()
     if online_only:
@@ -1336,7 +1264,7 @@ async def get_agents(online_only: bool = False) -> dict:
     return {"items": items}
 
 
-@app.get("/v1/topics")
+@app.get("/api/topics")
 async def get_topics() -> dict:
     return {"items": list_topics()}
 
@@ -1384,6 +1312,7 @@ async def ws_agent(websocket: WebSocket) -> None:
 
         agent_id = claimed_agent_id
         upsert_agent_directory(agent_id, last_seen=True)
+        set_agent_presence(agent_id, True)
         sessions[agent_id] = Session(ws=websocket, connected_at=now_ts())
         await safe_send(websocket, {"type": "connected", "agent_id": agent_id})
         await flush_pending(agent_id)
@@ -1533,6 +1462,7 @@ async def ws_agent(websocket: WebSocket) -> None:
     finally:
         if agent_id and sessions.get(agent_id) and sessions[agent_id].ws is websocket:
             sessions.pop(agent_id, None)
+            set_agent_presence(agent_id, False)
 
 
 @app.websocket("/ws/federation")
@@ -1722,10 +1652,10 @@ app = _filter_app_routes(
         "/logout",
         "/topic",
         "/health",
-        "/v1/agents",
-        "/v1/relay",
-        "/v1/messages",
-        "/v1/topics",
+        "/api/agents",
+        "/api/relay",
+        "/api/messages",
+        "/api/topics",
     },
     title="AgentRelay Web",
 )

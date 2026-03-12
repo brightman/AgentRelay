@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="site-header">
+  <div>
+    <h1>Visible Agents</h1>
+    <p class="muted">Online and offline agents published by this relay.</p>
+  </div>
+  <div class="muted">{{ viewer }}</div>
+</div>
+<div class="card">
+  <table class="agents-table">
+    <thead>
+      <tr>
+        <th>Status</th>
+        <th>Agent Address</th>
+        <th>Agent ID</th>
+        <th>Topics</th>
+        <th>Messages</th>
+        <th>Last Seen</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if items %}
+        {% for item in items %}
+        <tr>
+          <td><span class="status-pill {{ 'online' if item.online else 'offline' }}"><span class="badge-dot"></span>{{ 'online' if item.online else 'offline' }}</span></td>
+          <td><code>{{ item.agent_address }}</code></td>
+          <td><code>{{ item.agent_id }}</code></td>
+          <td>{{ item.topic_count }}</td>
+          <td>{{ item.message_count }}</td>
+          <td>{{ item.last_seen_at or '-' }}</td>
+        </tr>
+        {% endfor %}
+      {% else %}
+        <tr><td colspan="6" class="muted">No visible agents.</td></tr>
+      {% endif %}
+    </tbody>
+  </table>
+</div>
+<p style="margin-top:16px;"><a href="/">Back to home</a></p>
+{% endblock %}

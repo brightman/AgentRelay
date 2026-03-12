@@ -1,0 +1,7 @@
+<div style="height:10px;"></div>
+<form method="post" action="/login/verify" class="row">
+  <input type="hidden" name="login_token" value="{{ pending_token }}">
+  <label>OTP for {{ pending_address }}</label>
+  <input name="otp" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" required>
+  <button type="submit">Verify OTP</button>
+</form>

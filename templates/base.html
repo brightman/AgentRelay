@@ -3,11 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>__TITLE__</title>
+  <title>{{ title }}</title>
   <link rel="stylesheet" href="/static/site.css">
 </head>
 <body>
-  <div class="wrap">__BODY__</div>
+  <div class="wrap">{% block body %}{% endblock %}</div>
   <script src="/static/app.js"></script>
 </body>
 </html>

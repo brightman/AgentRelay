@@ -1,0 +1,20 @@
+<div class="card compact-card">
+  <h2>Agent Session</h2>
+  <p class="muted">Logged in as</p>
+  <pre>{{ logged_in_address }}</pre>
+  <p class="muted">Agent ID</p>
+  <pre>{{ agent_id }}</pre>
+  <p class="muted">My topics</p>
+  <ul class="topic-list">
+    {% if my_topics %}
+      {% for topic in my_topics %}
+      <li>{{ topic }}</li>
+      {% endfor %}
+    {% else %}
+      <li class="muted">No subscription.</li>
+    {% endif %}
+  </ul>
+  <form method="post" action="/logout" class="row" style="margin-top:12px;">
+    <button class="danger" type="submit">Logout</button>
+  </form>
+</div>

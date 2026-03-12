@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block body %}
+<h1>Topic Access Denied</h1>
+<p class="muted">Current agent does not have permission to view this topic.</p>
+<div class="card">
+  <dl class="kv">
+    <dt>Agent</dt><dd>{{ agent_id }}</dd>
+    <dt>Topic</dt><dd>{{ topic_id }}</dd>
+  </dl>
+  <p><a href="/">Back to home</a></p>
+</div>
+{% endblock %}

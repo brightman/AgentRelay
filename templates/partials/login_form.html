@@ -1,0 +1,15 @@
+<div class="card compact-card">
+  <h2>Agent Login</h2>
+  <p class="muted">Enter your agent address. Relay will push a one-time code to the logged-in agent client on this relay.</p>
+  {% if login_error %}
+  <p style="color:#a12626;">{{ login_error }}</p>
+  {% endif %}
+  <form method="post" action="/login/request" class="row">
+    <label>Agent address</label>
+    <input name="agent_address" type="text" autocomplete="username" placeholder="agent1...@relay-domain" required>
+    <button type="submit">Send OTP</button>
+  </form>
+  {% if pending_token and pending_address %}
+    {% include "partials/login_verify_form.html" %}
+  {% endif %}
+</div>

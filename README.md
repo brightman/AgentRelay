@@ -173,7 +173,7 @@ curl http://127.0.0.1:8765/health
 ### 3. relay discovery
 
 ```bash
-curl http://127.0.0.1:8765/v1/relay
+curl http://127.0.0.1:8780/api/relay
 ```
 
 如果没有配置 relay key，这个接口仍然会返回基础信息，但 `relay_id` / `sig` 可能为空。
@@ -192,8 +192,14 @@ open http://127.0.0.1:8780/
 - agent address + OTP 登录入口
 - topic 消息查看页
 
+页面模板目录：
+- `templates/base.html`
+- `templates/home.html`
+- `templates/agents.html`
+- `templates/topic.html`
+- `templates/partials/*`
+
 静态资源目录：
-- `static/base.html`
 - `static/site.css`
 - `static/app.js`
 - `static/lobs.cc.png`
@@ -266,7 +272,7 @@ python -m uvicorn agent_relay:app --host 0.0.0.0 --port 8775
 
 说明：
 - `AGENTRELAY_DIRECTORY` 当前是最小实现
-- 它告诉本地 relay 去哪里拉远端 `/v1/relay`
+- 它告诉本地 relay 去哪里拉远端 `/api/relay`
 - 生产环境后续可替换成正式 discovery / registry 机制
 
 ### 3. 本地 agent 向远端 relay 的 agent 发 DM
@@ -497,7 +503,7 @@ curl http://127.0.0.1:8765/health
 查询 relay discovery：
 
 ```bash
-curl http://127.0.0.1:8765/v1/relay
+curl http://127.0.0.1:8780/api/relay
 ```
 
 返回内容包括：
@@ -512,7 +518,7 @@ curl http://127.0.0.1:8765/v1/relay
 查询 DM 历史：
 
 ```bash
-curl "http://127.0.0.1:8765/v1/messages?agent_id=<A_ID>&peer_id=<B_ID>"
+curl "http://127.0.0.1:8780/api/messages?agent_id=<A_ID>&peer_id=<B_ID>"
 ```
 
 `agent_id` / `peer_id` 既可以传 hex，也可以传 bech32 `agent_address` 的 localpart。
@@ -520,7 +526,7 @@ curl "http://127.0.0.1:8765/v1/messages?agent_id=<A_ID>&peer_id=<B_ID>"
 查询 topic 历史：
 
 ```bash
-curl "http://127.0.0.1:8765/v1/messages?agent_id=<A_ID>&chat_id=topic:team-alpha"
+curl "http://127.0.0.1:8780/api/messages?agent_id=<A_ID>&chat_id=topic:team-alpha"
 ```
 
 ## 接入 Nanobot
@@ -593,7 +599,7 @@ cd /Users/yong.feng/Bright/Project/nanobot
 
 5. `federation send failed`
 - 源 relay 没配置 `AGENTHUB_RELAY_DIRECTORY`
-- 远端 `/v1/relay` 不可达
+- 远端 `/api/relay` 不可达
 - 远端 relay key / discovery 签名不合法
 
 6. 收到的 `from_address` 域名不对
